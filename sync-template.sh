@@ -44,6 +44,7 @@ FILES=(
   '--copy=.travis/runtox'
   '--copy=.travis/utils.sh'
   '--copy=.travis.yml'
+  '--copy=.yamllint.yml'
   '--copy-if-missing=custom_requirements.txt'
   '--copy-if-missing=LICENSE'
   '--copy-recursively=molecule'
