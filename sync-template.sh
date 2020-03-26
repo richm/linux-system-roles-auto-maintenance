@@ -45,6 +45,7 @@ FILES=(
   '--copy=.travis/utils.sh'
   '--copy=.travis.yml'
   '--copy=.yamllint.yml'
+  '--copy-if-missing=.yamllint_custom.yml'
   '--copy-if-missing=custom_requirements.txt'
   '--copy-if-missing=LICENSE'
   '--copy-recursively=molecule'
