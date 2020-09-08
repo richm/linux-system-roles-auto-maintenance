@@ -5,11 +5,35 @@ import sys
 import logging
 from pathlib import Path
 
+import ansiblelint
 from ansiblelint import AnsibleLintRule, RulesCollection, Runner
-from ansiblelint.utils import get_playbooks_and_roles
+import ansiblelint.utils
+from ansiblelint.utils import get_playbooks_and_roles, find_children
 
 if os.environ.get("LSR_DEBUG") == "true":
     logging.getLogger().setLevel(logging.DEBUG)
+
+# monkeypatch find_children to fix this issue:
+# WARNING: Couldn't open /home/rmeggins/working/lsr/network/tests/playbooks/tasks/tasks/show_interfaces.yml - No such file or directory
+# I guess ansible-lint doesn't use the same relative path resolution mechanism that ansible uses
+orig_find_children = ansiblelint.utils.find_children
+def fix_find_children(playbook, playbook_dir):
+    results = []
+    for child in orig_find_children(playbook, playbook_dir):
+        child["path"] = child["path"].replace("tasks/tasks/", "tasks/")
+        results.append(child)
+    return results
+ansiblelint.utils.find_children = fix_find_children
+
+# monkeypatch _append_skipped_rules to fix this issue:
+# Error trying to append skipped rules: RuntimeError('Unexpected file type: pre_tasks')
+orig___append_skipped_rules = ansiblelint.utils._append_skipped_rules
+def fix__append_skipped_rules(pyyaml_data, file_text, file_type):
+    new_file_type = file_type
+    if file_type in ["pre_tasks", "post_tasks"]:
+        new_file_type = "tasks"
+    return orig___append_skipped_rules(pyyaml_data, file_text, new_file_type)
+ansiblelint.utils._append_skipped_rules = fix__append_skipped_rules
 
 class LSRole2CollectionScanner(AnsibleLintRule):
     id = '999'
@@ -80,8 +104,6 @@ def get_role_playbooks_subroles_modules(role_path):
         def __init__(self, d):
             self.__dict__ = d
     opts = Options({"exclude_paths": [], "verbosity": False})
-    cwd = os.getcwd()
-    os.chdir(role_path)
     # this returns only playbooks and sub-role directories
     # this adds "." since it works in cwd - we have to replace
     # that with role_path
@@ -97,13 +119,14 @@ def get_role_playbooks_subroles_modules(role_path):
         for mod_file in library_path.iterdir():
             if mod_file.is_file() and mod_file.stem != "__init__":
                 role_modules.add(mod_file.stem)
-    os.chdir(cwd)
     return role_pbs, role_modules
 
 
 def use_ansible_lint():
     # assume args are lsr role directories
     for role_path in sys.argv[1:]:
+        cwd = os.getcwd()
+        os.chdir(role_path)
         role_pbs, role_modules = get_role_playbooks_subroles_modules(role_path)
         role_pbs = sorted(role_pbs)
         rules = RulesCollection()
@@ -118,6 +141,8 @@ def use_ansible_lint():
             os.path.join(role_path, "tests", "roles", f"linux-system-roles.{role_name}"),
             os.path.join(role_path, "tests", "playbooks", "roles", role_name),
             os.path.join(role_path, "tests", "playbooks", "roles", f"linux-system-roles.{role_name}"),
+            os.path.join(role_path, "examples", "roles", role_name),
+            os.path.join(role_path, "examples", "roles", f"linux-system-roles.{role_name}"),
         ]
         for role_or_pb in role_pbs:
             runner = Runner(rules, role_or_pb, tags, skip_list, exclude_paths)
@@ -125,6 +150,7 @@ def use_ansible_lint():
             #                 options.skip_list, options.exclude_paths,
             #                 options.verbosity, checked_files)
             runner.run()
+        os.chdir(cwd)
 
 
 def use_ansible_lint_get_pb_and_roles():
@@ -141,20 +167,136 @@ def use_ansible_lint_get_pb_and_roles():
         result = get_playbooks_and_roles(opts)
     os.chdir(cwd)
 
+ROLE_DIRS = ["defaults", "examples", "files", "handlers", "library", "meta",
+    "module_utils", "tasks", "templates", "tests", "vars"]
 
-def use_ansible(filepath):
-    from ansible import constants
-    from ansible.errors import AnsibleError
-    from ansible.errors import AnsibleParserError
-    from ansible.parsing.dataloader import DataLoader
-    from ansible.parsing.mod_args import ModuleArgsParser
-    from ansible.parsing.splitter import split_args
-    from ansible.parsing.yaml.constructor import AnsibleConstructor
-    from ansible.parsing.yaml.loader import AnsibleLoader
-    from ansible.parsing.yaml.objects import AnsibleSequence
-    from ansible.plugins.loader import module_loader
-    dl = DataLoader()
-    return dl.load_from_file(filepath)
+def is_role_dir(role_path, dirpath):
+    if role_path == dirpath:
+        return False
+    dir_pth = Path(dirpath)
+    relpath = dir_pth.relative_to(role_path)
+    base_dir = relpath.parts[0]
+    return base_dir in ROLE_DIRS
+
+PLAY_KEYS = {
+    "gather_facts",
+    "handlers",
+    "hosts",
+    "import_playbook",
+    "post_tasks",
+    "pre_tasks",
+    "roles"
+    "tasks",
+}
+
+import codecs
+from ansible import constants
+from ansible.errors import AnsibleError
+from ansible.errors import AnsibleParserError
+from ansible.parsing.dataloader import DataLoader
+from ansible.parsing.mod_args import ModuleArgsParser
+from ansible.parsing.splitter import split_args
+from ansible.parsing.yaml.constructor import AnsibleConstructor
+from ansible.parsing.yaml.loader import AnsibleLoader
+from ansible.parsing.yaml.objects import AnsibleSequence, AnsibleMapping
+from ansible.plugins.loader import module_loader
+
+def get_file_type(item):
+    if isinstance(item, AnsibleMapping):
+        if "galaxy_info" in item or "dependencies" in item:
+            return "meta"
+        return "vars"
+    elif isinstance(item, AnsibleSequence):
+        return "tasks"
+    else:
+        raise Exception(f"Error: unknown type of file: {item}")
 
 
-use_ansible_lint()
+def get_item_type(item):
+    if isinstance(item, AnsibleMapping):
+        for key in PLAY_KEYS:
+            if key in item:
+                return "play"
+        if "block" in item:
+            return "block"
+        return "task"
+    else:
+        raise Exception(f"Error: unknown type of item: {item}")
+
+def handle_other(item):
+    """handle properties of Ansible item other than vars and tasks"""
+    return
+
+def handle_vars(item):
+    """handle vars of Ansible item"""
+    for var in item.get("vars", []):
+        print(f"\tvar = {var}")
+    return
+
+def handle_meta(item):
+    """handle meta/main.yml file"""
+    print(f"\tmeta dependencies {item.get('dependencies')}")
+
+def handle_task(task):
+    """handle a single task"""
+    mod_arg_parser = ModuleArgsParser(task)
+    try:
+        action, arguments, _ = mod_arg_parser.parse(skip_action_validation=True)
+    except AnsibleParserError as e:
+        raise SystemExit("Couldn't parse task at %s (%s)\n%s" % (task, e.message, task))
+    print(f"\ttask action {action} args {arguments}")
+    handle_tasks(task)
+
+def handle_task_list(tasks):
+    """item is a list of Ansible Task objects"""
+    for task in tasks:
+        if "block" in task:
+            handle_tasks(task)
+        else:
+            handle_task(task)
+    
+def handle_tasks(item):
+    """item has one or more fields which hold a list of Task objects"""
+    if "always" in item:
+        handle_task_list(item["always"])
+    if "block" in item:
+        handle_task_list(item["block"])
+    if "handlers" in item:
+        handle_task_list(item["post_tasks"])
+    if "pre_tasks" in item:
+        handle_task_list(item["pre_tasks"])
+    if "post_tasks" in item:
+        handle_task_list(item["post_tasks"])
+    if "rescue" in item:
+        handle_task_list(item["rescue"])
+    if "tasks" in item:
+        handle_task_list(item["tasks"])
+
+def use_ansible():
+    role_path = sys.argv[1]
+    for (dirpath, _, filenames) in os.walk(role_path):
+        if not is_role_dir(role_path, dirpath):
+            continue
+        for filename in filenames:
+            if not filename.endswith(".yml"):
+                continue
+            filepath = os.path.join(dirpath, filename)
+            print(f"filepath {filepath}")
+            dl = DataLoader()
+            ans_data = dl.load_from_file(filepath)
+            file_type = get_file_type(ans_data)
+            if file_type == "vars":
+                handle_vars(item)
+                continue
+            if file_type == "meta":
+                handle_meta(item)
+                continue
+            for item in ans_data:
+                ans_type = get_item_type(item)
+                handle_tasks(item)
+                handle_vars(item)
+                handle_other(item)
+                if ans_type == "task":
+                    handle_task(item)
+
+use_ansible()
