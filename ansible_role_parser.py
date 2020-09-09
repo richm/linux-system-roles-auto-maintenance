@@ -3,6 +3,7 @@
 import os
 import sys
 import logging
+import re
 from pathlib import Path
 
 from ansible.errors import AnsibleParserError
@@ -85,6 +86,9 @@ def handle_task(task, role_modules):
         raise SystemExit("Couldn't parse task at %s (%s)\n%s" % (task, e.message, task))
     if action == "include_role" or action == "import_role":
         print(f"\ttask role {task[action]['name']}")
+        if task[action]['name'].startswith("{{"):
+            item = re.sub('[{} ]', '', task[action]['name'])
+            print("NEED TO FIND A FILE WHERE {0} IS DECLARED".format(item))
     elif action in role_modules:
         print(f"\ttask role module {action}")
     handle_tasks(task, role_modules)
@@ -114,14 +118,15 @@ def handle_tasks(item, role_modules):
     if "tasks" in item:
         handle_task_list(item["tasks"], role_modules)
 
-def parse_role(role_path):
+def parse_role(role_path, rel_path):
     role_modules = set()
     library_path = Path(os.path.join(role_path, "library"))
     if library_path.is_dir():
         for mod_file in library_path.iterdir():
             if mod_file.is_file() and mod_file.stem != "__init__":
                 role_modules.add(mod_file.stem)
-    for (dirpath, _, filenames) in os.walk(role_path):
+    top_dir = Path(os.path.join(role_path, rel_path))
+    for (dirpath, _, filenames) in os.walk(top_dir):
         if not is_role_dir(role_path, dirpath):
             continue
         for filename in filenames:
@@ -136,10 +141,10 @@ def parse_role(role_path):
                 continue
             file_type = get_file_type(ans_data)
             if file_type == "vars":
-                handle_vars(item)
+                handle_vars(ans_data)
                 continue
             if file_type == "meta":
-                handle_meta(item)
+                handle_meta(ans_data)
                 continue
             for item in ans_data:
                 ans_type = get_item_type(item)
@@ -149,5 +154,6 @@ def parse_role(role_path):
                     handle_task(item, role_modules)
                 handle_tasks(item, role_modules)
 
-for role_path in sys.argv[1:]:
-    parse_role(role_path)
+role_path = sys.argv[1]
+rel_path = sys.argv[2]
+parse_role(role_path, rel_path)
