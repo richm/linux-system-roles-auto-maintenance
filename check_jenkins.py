@@ -20,8 +20,12 @@ username = cfg[cfg["current"]]["username"]
 job_name = cfg[cfg["current"]]["job_name"]
 ssh_private_key = cfg[cfg["current"]].get("ssh_private_key")
 ssh_user = cfg[cfg["current"]].get("ssh_user")
+token = cfg[cfg["current"]].get("token")
 
-server = jenkins.Jenkins(url, username=username)
+kwargs = {"username": username}
+if token:
+    kwargs["password"] = token
+server = jenkins.Jenkins(url, **kwargs)
 job = server.get_job_info(job_name, depth=0, fetch_all_builds=False)
 # yaml.safe_dump(job, open("junk.yml", "w"))
 task_nums = [build["number"] for build in job["builds"]]
@@ -263,8 +267,8 @@ def print_completed_tasks(server, task_nums, args):
             print(format_fields(task, "completed", ts))
 
 
-def stop_tasks(server, task_nums, args):
-    """Stop tasks matching the display_name pattern."""
+def cancel_tasks(server, task_nums, args):
+    """Cancel given tasks."""
     for num in args:
         print(f"Stopping {num}")
         server.stop_build(job_name, num)
@@ -428,6 +432,36 @@ def print_node_info(server, task_nums, args):
 #         pass
 #     cmd = f"scp -i {ssh_private_key} {ssh_user}@{ip}:"
 #     subprocess.run(cmd)
+
+
+def cancel_duplicate_tasks(server, task_nums, args):
+    """Stop duplicate queued and running tasks.  Keep the newest one."""
+    key_to_task = set()
+    queue_info = server.get_queue_info()
+    for task in queue_info:
+        if task["task"]["name"] == job_name:
+            label = get_pr_status_label(task, False)
+            role, prnum = get_pr_info(task)
+            key = f"{label}:{role}:{prnum}"
+            if key in key_to_task:
+                tsstr = datetime.datetime.fromtimestamp(task["inQueueSince"] / 1000).isoformat(
+                    timespec="seconds"
+                )
+                print(f"Cancelling duplicate queued task {task['id']} {key} {tsstr}")
+                server.cancel_queue(task["id"])
+            else:
+                key_to_task.add(key)
+    for task, ts in task_iter(task_nums, server):
+        if task["result"] is None:
+            label = get_pr_status_label(task, False)
+            role, prnum = get_pr_info(task)
+            key = f"{label}:{role}:{prnum}"
+            if key in key_to_task:
+                tsstr = ts.isoformat(timespec="seconds")
+                print(f"Cancelling duplicate running task {task['id']} {key} {tsstr}")
+                server.stop_build(job_name, task['id'])
+            else:
+                key_to_task.add(key)
 
 
 if len(sys.argv) > 1:
